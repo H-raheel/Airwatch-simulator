@@ -1,40 +1,31 @@
 require('dotenv').config();
-const mysql = require('mysql2/promise');
-const { Client } = require('pg');
 const { faker } = require('@faker-js/faker');
-
+const express = require('express');
+const { initMySQLPool, initPostgresClient, ensureDatabases } = require('./dbConfig');
 
 const {
-  MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE,
-  PG_HOST, PG_USER, PG_PASSWORD, PG_DATABASE,
-  DATA_INTERVAL_SECONDS
+  DATA_INTERVAL_SECONDS,
+  PORT = 3000
 } = process.env;
 
+let mysqlPool;
+let pgClient;
+let lastInsertedData = null;
+
 async function main() {
-  // Connect MySQL
-  const mysqlConnection = await mysql.createPool({
-    host: MYSQL_HOST,
-    user: MYSQL_USER,
-    password: MYSQL_PASSWORD,
-    database: MYSQL_DATABASE,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-  });
+  // Ensure databases and tables
+  await ensureDatabases();
 
-  // Connect PostgreSQL
-  const pgClient = new Client({
-    host: PG_HOST,
-    user: PG_USER,
-    password: PG_PASSWORD,
-    database: PG_DATABASE,
-  });
-  await pgClient.connect();
+  // Initialize connections
+  mysqlPool = await initMySQLPool();
+  pgClient = await initPostgresClient();
 
-  // Periodically insert fake air sensor data into MySQL
+  // Periodic fake data insertion into MySQL
   setInterval(async () => {
     try {
       const sensorData = generateFakeSensorData();
+      lastInsertedData = sensorData;
+
       const sql = `
         INSERT INTO air_sensors 
         (sensor_id, timestamp, pm25, pm10, co, no2, o3, so2, temperature, humidity)
@@ -50,27 +41,25 @@ async function main() {
         sensorData.o3,
         sensorData.so2,
         sensorData.temperature,
-        sensorData.humidity,
+        sensorData.humidity
       ];
 
-      await mysqlConnection.execute(sql, values);
+      await mysqlPool.execute(sql, values);
       console.log('Inserted new sensor data:', sensorData);
-    } catch (error) {
-      console.error('MySQL insert error:', error);
+    } catch (err) {
+      console.error('MySQL Insert Error:', err.message);
     }
   }, (DATA_INTERVAL_SECONDS || 10) * 1000);
 
-  // Periodically sync latest data from MySQL to PostgreSQL
+  // Periodic sync from MySQL to PostgreSQL
   setInterval(async () => {
     try {
-      // Fetch recent data from MySQL (e.g., last 100 rows)
-      const [rows] = await mysqlConnection.query(
+      const [rows] = await mysqlPool.query(
         `SELECT * FROM air_sensors ORDER BY timestamp DESC LIMIT 100`
       );
 
-      // Upsert into PostgreSQL table air_sensors (make sure table exists)
       for (const row of rows) {
-        const upsertQuery = `
+        const upsert = `
           INSERT INTO air_sensors (id, sensor_id, timestamp, pm25, pm10, co, no2, o3, so2, temperature, humidity)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
           ON CONFLICT (id) DO UPDATE SET
@@ -83,9 +72,9 @@ async function main() {
             o3 = EXCLUDED.o3,
             so2 = EXCLUDED.so2,
             temperature = EXCLUDED.temperature,
-            humidity = EXCLUDED.humidity;`;
+            humidity = EXCLUDED.humidity`;
 
-        const pgValues = [
+        const values = [
           row.id,
           row.sensor_id,
           row.timestamp,
@@ -99,29 +88,45 @@ async function main() {
           row.humidity
         ];
 
-        await pgClient.query(upsertQuery, pgValues);
+        await pgClient.query(upsert, values);
       }
 
-      console.log('Synced latest data from MySQL to PostgreSQL');
-    } catch (error) {
-      console.error('Postgres sync error:', error);
+      console.log('Synced latest data to PostgreSQL');
+    } catch (err) {
+      console.error('PostgreSQL Sync Error:', err.message);
     }
-  }, 60000); // every 60 seconds
+  }, 60000);
 }
 
 function generateFakeSensorData() {
   return {
-    sensor_id: 'sensor-' + faker.datatype.number({ min: 1, max: 10 }),
+    sensor_id: 'sensor-' + faker.number.int({ min: 1, max: 10 }),
     timestamp: new Date(),
-    pm25: faker.datatype.float({ min: 0, max: 500, precision: 0.1 }),
-    pm10: faker.datatype.float({ min: 0, max: 500, precision: 0.1 }),
-    co: faker.datatype.float({ min: 0, max: 50, precision: 0.01 }),
-    no2: faker.datatype.float({ min: 0, max: 200, precision: 0.01 }),
-    o3: faker.datatype.float({ min: 0, max: 300, precision: 0.01 }),
-    so2: faker.datatype.float({ min: 0, max: 100, precision: 0.01 }),
-    temperature: faker.datatype.float({ min: -10, max: 45, precision: 0.1 }),
-    humidity: faker.datatype.float({ min: 0, max: 100, precision: 0.1 }),
+    pm25: faker.number.float({ min: 0, max: 500, precision: 0.1 }),
+    pm10: faker.number.float({ min: 0, max: 500, precision: 0.1 }),
+    co: faker.number.float({ min: 0, max: 50, precision: 0.01 }),
+    no2: faker.number.float({ min: 0, max: 200, precision: 0.01 }),
+    o3: faker.number.float({ min: 0, max: 300, precision: 0.01 }),
+    so2: faker.number.float({ min: 0, max: 100, precision: 0.01 }),
+    temperature: faker.number.float({ min: -10, max: 45, precision: 0.1 }),
+    humidity: faker.number.float({ min: 0, max: 100, precision: 0.1 })
   };
 }
 
-main().catch(console.error);
+// Express HTTP server
+const app = express();
+
+app.get('/', (req, res) => {
+  res.send('Airwatch service is healthy');
+});
+
+app.get('/latest-data', (req, res) => {
+  if (lastInsertedData) res.json(lastInsertedData);
+  else res.status(204).send('No data generated yet');
+});
+
+app.listen(PORT, () => {
+  console.log(`HTTP server listening on port ${PORT}`);
+});
+
+main().catch(err => console.error('Startup error:', err));
