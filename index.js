@@ -1,7 +1,8 @@
 require('dotenv').config();
 const mysql = require('mysql2/promise');
 const { Client } = require('pg');
-const faker = require('faker');
+const { faker } = require('@faker-js/faker');
+
 
 const {
   MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE,
